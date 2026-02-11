@@ -216,3 +216,21 @@ tags
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,vim
 
 wandb/
+
+# --- experiment artifacts / big files ---
+logs-expert/
+logs-bc/
+eval_output_*/
+exp_runs/**/preview.mp4
+exp_runs/**/videos/
+exp_runs/**/data/
+exp_runs/**/policies/
+exp_runs/**/checkpoints/
+*.mp4
+*.npz
+*.pkl
+
+# --- local env ---
+.conda/
+uv.lock
+

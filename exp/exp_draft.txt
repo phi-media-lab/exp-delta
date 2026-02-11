@@ -1,0 +1,177 @@
+
+---
+
+## 0) 先解释你现在的现象：length ↑，return → 0，但 solved 仍 0 ——这对“做 RTC 方法学实验”意味着什么？
+
+你现在两轮都评的是 **naive, delay=0, execute_horizon=1**（也就是最简单的闭环设置），但 solved 还是 0。这个结论对 RTC 实验设计非常关键：**目前你的 policy 还没到“能稳定解关”的水平**，所以此时去做“RTC vs baseline、tail control 增益”会被“策略本身太弱”淹没。
+
+从代码逻辑看，你的数据链路是：
+
+1. `train_expert.py` 训练 PPO expert（你的 log 里 expert solved 仍 0）
+2. `generate_data.py` 会从每个 seed 里挑“solve_rate >= threshold”的 checkpoint 采样；不达标会被标记 `[MASKED]`，但你 smoke 时把阈值设为 0.0 才避免崩掉（这点也和代码设计吻合：默认阈值是 0.65）
+3. `train_flow.py` 训练 flow BC，学到的是“在弱 expert 分布上更稳”的行为，**很容易出现你看到的：length 变长、return 逼近 0，但还是不触发成功条件**（因为示教里就几乎没成功轨迹）
+
+**结论**：
+
+> 在开始 RTC/tail 相关实验之前，必须先拿到一个“非零 solved”的基线 policy（哪怕 5%~20%）——否则任何延迟/尾延迟实验都会测不出增益，或者结果高度不可解释。
+
+最快路径不是继续本地从 0 训到 0.65 solved，而是直接用仓库 README 指向的 **预训练 checkpoints / 数据（gs://rtc-assets）**做评测与方法学实验（这也是作者 intended workflow）。
+
+---
+
+## 1) 针对 RTC：当前代码评估逻辑是什么？它和论文“固定 d sweep”一致，但不支持 tail 分布实验
+
+你现在的 `eval_flow.py` 做的是：
+
+* 外层 **穷举 sweep**：`inference_delay in [0..4]`，`execute_horizon` 满足 `execute_horizon >= inference_delay`（你的结果里 delay=0, exec=1 就是其中一个点）
+* `method` 有 naive / realtime / bid / hard_masking 等（和论文里对照组一致）
+* 运行时把“延迟 d”当成 **常数**，每个 rollout 全程固定 d（这也对应 RTC 论文仿真设置：simulate delays 0..4，固定 d 作图）
+
+**问题**：你问的“尾延迟控制”实验要的是 **d 是随机变量、有长尾**，而不是固定常数。所以我们要在评测侧做一个“**per-chunk/per-iteration 的 d 采样器**”，并增加 “tail control on/off” 两种 profile。
+
+---
+
+## 2) 先把“能跑的策略基线”搞定：为了做 RTC/tail，最低需要这两件事
+
+### 2.1 用预训练 BC policy 做 baseline（推荐）
+
+* 直接下载 `gs://rtc-assets/bc/`（README 提供）并用 `src/eval_flow.py` 跑全 sweep（会得到论文一样的曲线形态）。
+  这一步的意义是：**先验证你机器/环境下 eval 可复现“RTC>naive>TE”这种排序**，再往 tail 控制扩展。
+
+### 2.2 如果必须本地训：至少让 expert 在 grasp_easy 上有非零 solved
+
+否则 generate_data 会一直在“低质量数据”上循环。你现在 expert 到 update=100 仍 solved=0 就是这个情况。
+
+---
+
+## 3) 在现有代码上新增“尾延迟/tail control”实验：具体怎么改、改哪几处
+
+### 3.1 新增一个 EvalConfig：支持 delay profile（随机 d 序列）而不是单一常数
+
+在 `EvalConfig` 里现在只有 `inference_delay: int`。你可以改成二选一：
+
+* `inference_delay: int`（保持现有固定 d sweep）
+* `delay_profile: DelayProfileConfig | None`（新增：随机 d）
+
+**DelayProfileConfig 建议字段：**
+
+* `mode`: `"fixed" | "mixture" | "trace"`
+* `dt_ms`: 控制周期（把 ms→step 的映射写清楚）
+* `mixture`: `{p_spike, d_spike, d_base_dist}`（用于长尾 vs 尾控）
+* `tail_control`: `{enabled, cap_d, drop_spike_prob}`（用来表达“尾延迟控制机制”）
+
+这样你能构造两套 profile：
+
+* **Long-tail**：小概率大 d（spike）
+* **Tail-controlled**：spike 被抑制/被 cap
+
+### 3.2 改 eval loop：让每次 execute_chunk 都采样一个 d
+
+你现在 execute_chunk 里直接用 `config.inference_delay` 来：
+
+* 冻结前缀 / guidance（realtime_action 参数）
+* 从旧 chunk 拿前 `d` 个动作 + 新 chunk 拿后面的动作拼执行序列
+
+这段逻辑其实非常适合 “d 每次不同”：
+
+* 把 `d_t` 从“常数”变成“每个 chunk 一次采样的随机变量”
+* 对于 JAX：不能在 jit 的核心里用 Python random；但你现在 eval 是在 JAX scan 里跑的，所以要用 **jax.random** 来采样 d，并把 d 当 carry 的一部分。
+
+**实现上最小侵入**：
+
+* 在 `execute_chunk` carry 里加入一个 `delay_rng`
+* 每次 split RNG，采样 `d_t`
+* 计算 `d_t` 后再调用 `policy.realtime_action(..., inference_delay=d_t, ...)`
+
+### 3.3 加“tail control”机制：把它做成 d sampler 的后处理
+
+所谓“尾延迟控制机制”在实验里可以抽象成对 d 的变换，比如：
+
+* **硬 cap**：`d_t = min(d_t, cap_d)`
+* **概率削尾**：对 spike 事件按概率 drop（把 d_spike 重新采成 base）
+* **预测/估计**：模拟 RTC 论文 Algorithm 1 的 delay buffer，用 `max(Q)` 作为“保守预测 d_hat”去冻结前缀（你可以在评估里比 oracle d vs estimated d）
+
+RTC 论文强调他们会用过去 delay 的 buffer 来 forecast 下一次 delay，并且执行 horizon 设为 `s=max(d, smin)`（这是系统层面对 tail 的一种“自适应执行 horizon”策略）。
+你现有 eval 里把 execute_horizon 当常数 sweep，所以我们可以做一个新实验轴：`execute_horizon_policy = fixed | adaptive`。
+
+---
+
+## 4) 指标与产物：tail 相关实验必须额外记录哪些东西（现在 results.csv 不够）
+
+你现有 `results.csv` 只有 return/length/solved。做 tail 机制，至少再加：
+
+### 4.1 延迟侧：d 分布与违规率
+
+* `d_p50, d_p95, d_p99`
+* `p(d > H-s)`（action prefix 不存在的违规概率；training-time RTC 图里也强调这个约束）
+* `mean_execute_horizon`（如果你启用自适应 s）
+
+### 4.2 控制质量侧：jerk proxy（RTC 论文主打）
+
+RTC 论文用 “max acceleration（二阶差分）”作为 jerk proxy，并展示 β 过大/延迟高会变 jerk。
+你现在 eval 里已经能拿到 action chunk 和执行序列，所以可直接记录：
+
+* `max ||Δa||`（一阶差分）
+* `max ||Δ²a||`（二阶差分）
+
+### 4.3 方法成本侧：推理开销（尤其 inference-time RTC 会增加）
+
+Training-time RTC 论文指出 inference-time inpainting 有额外计算开销/延迟，削弱“实时”的意义。
+你现在 JAX eval 是纯 on-device，很难用 wall-clock 精确，但仍能记录：
+
+* `jax.profiler` trace（可选）
+* 或者把“policy.action / realtime_action”的 `num_flow_steps` 作为 proxy（论文也固定 n=5）
+
+---
+
+## 5) 推荐的 RTC-tail 实验矩阵（以你现在 repo 为基准，能直接落地）
+
+前提：用 **预训练 bc policy** 或训练出非零 solved policy。
+
+### 轴 1：延迟分布（2 组）
+
+* Long-tail profile（spike 概率 5%）
+* Tail-controlled profile（spike 概率 0.5% 或 cap_d）
+
+### 轴 2：方法（至少 4 个）
+
+* naive
+* realtime (soft masking, exp schedule) —— RTC 论文默认推荐 exp decay 
+* hard_masking（你代码里对应 prefix_attention_schedule="zeros"）
+* bid（可选，成本更高，论文中也强调）
+
+### 轴 3：执行策略
+
+* fixed execute_horizon（保持现在 sweep 的形式）
+* adaptive execute_horizon：`s=max(d, smin)`（RTC Algorithm 1 思路）
+
+### 输出
+
+* solve rate vs tail profile（方法分组）
+* jerk proxy vs tail profile
+* d 分布（P95/P99）和违规率（d>H-s）
+
+---
+
+## 6) 结合你当前运行遇到的工程坑：对实验设计的“约束/修复建议”
+
+1. **train_flow 默认每 epoch 都做大量 eval（8 个 horizon × 2048 rollout）**，在你机器上会极慢甚至 OOM。你已经观察到了。
+   → 方法学实验建议把训练与评测解耦：训练阶段 eval 降到很小（或关掉），最终统一用 eval_flow 做 sweep。
+
+2. **大模型 XLA GPU compiler crash / OOM**：你已经遇到了。
+   → 这会污染“延迟分布”，导致所谓 tail 其实是编译/回收抖动。建议：
+
+   * 固定模型规模（用稳定小模型）做方法学；
+   * 或直接用预训练 checkpoints 做 eval（最干净）。
+
+3. **强制 JAX_PLATFORMS=gpu 会触发初始化异常**：你现在用 auto backend 才能跑。
+   → 做可复现实验时，把“环境变量组合”固定写进 run script（否则别人复现会踩坑）。
+
+---
+
+## 下一步我建议你做的两件“小改动、立刻能推进”的事
+
+1. **先用预训练 bc/24 checkpoint 跑一次 eval_flow 全 sweep（naive/realtime/hard/bid）**，看是否能复现论文里“RTC > baselines”的曲线形态（d=0..4）。这一步是 sanity check。
+2. 在 eval_flow 上加一个最小版本的 `delay_profile`：只实现 `mixture`（长尾 vs 尾控）+ 记录 d 的统计量。然后先只跑 grasp_easy 一关，方法只跑 naive vs realtime，快速看 tail 控制是否改变相对差距。
+
+`eval_flow.py`/`model.py` 中“realtime_action 调用点”和“action_chunk_to_execute 拼接点”的具体实现“ -> 该加哪些字段、carry 里放哪些变量、JAX random 怎么接进 scan”写成更接近 patch 的步骤清单。

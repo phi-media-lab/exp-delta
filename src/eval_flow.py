@@ -4,7 +4,7 @@ import functools
 import math
 import pathlib
 import pickle
-from typing import Sequence
+from typing import Literal, Sequence
 
 import flax.nnx as nnx
 import jax
@@ -39,6 +39,17 @@ class BIDMethodConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DelayProfileConfig:
+    mode: Literal["fixed", "mixture"] = "fixed"
+    fixed_delay: int = 0
+    p_spike: float = 0.0
+    d_spike: int = 4
+    base_delays: tuple[int, ...] = (0,)
+    base_probs: tuple[float, ...] = (1.0,)
+    tail_cap: int | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class EvalConfig:
     step: int = -1
     weak_step: int | None = None
@@ -46,10 +57,47 @@ class EvalConfig:
     num_flow_steps: int = 5
 
     inference_delay: int = 0
+    delay_profile: DelayProfileConfig | None = None
     execute_horizon: int = 1
     method: NaiveMethodConfig | RealtimeMethodConfig | BIDMethodConfig = NaiveMethodConfig()
 
     model: _model.ModelConfig = _model.ModelConfig()
+
+
+def sample_inference_delay(rng: jax.Array, config: EvalConfig, action_chunk_size: int) -> tuple[jax.Array, jax.Array]:
+    if config.delay_profile is None:
+        delay = jnp.array(config.inference_delay, dtype=jnp.int32)
+    else:
+        profile = config.delay_profile
+        if profile.mode == "fixed":
+            delay = jnp.array(profile.fixed_delay, dtype=jnp.int32)
+        elif profile.mode == "mixture":
+            if len(profile.base_delays) == 0:
+                raise ValueError("delay_profile.base_delays must be non-empty")
+            if len(profile.base_delays) != len(profile.base_probs):
+                raise ValueError(
+                    f"delay_profile.base_delays and delay_profile.base_probs must have same length: "
+                    f"{len(profile.base_delays)=} {len(profile.base_probs)=}"
+                )
+            rng, spike_key = jax.random.split(rng)
+            is_spike = jax.random.bernoulli(spike_key, p=profile.p_spike)
+            rng, base_key = jax.random.split(rng)
+            base_idx = jax.random.choice(
+                base_key,
+                len(profile.base_delays),
+                shape=(),
+                p=jnp.array(profile.base_probs, dtype=jnp.float32),
+            )
+            base_delay = jnp.array(profile.base_delays, dtype=jnp.int32)[base_idx]
+            delay = jnp.where(is_spike, jnp.array(profile.d_spike, dtype=jnp.int32), base_delay)
+        else:
+            raise ValueError(f"Unknown delay profile mode: {profile.mode}")
+
+        if profile.tail_cap is not None:
+            delay = jnp.minimum(delay, jnp.array(profile.tail_cap, dtype=jnp.int32))
+
+    delay = jnp.clip(delay, 0, action_chunk_size)
+    return rng, delay
 
 
 def eval(
@@ -66,7 +114,9 @@ def eval(
         wrappers.LogWrapper(wrappers.AutoReplayWrapper(train_expert.NoisyActionWrapper(env))), config.num_evals
     )
     render_video = train_expert.make_render_video(renderer_pixels.make_render_pixels(env_params, static_env_params))
-    assert config.execute_horizon >= config.inference_delay, f"{config.execute_horizon=} {config.inference_delay=}"
+    assert config.execute_horizon > 0, f"{config.execute_horizon=}"
+    if config.delay_profile is None:
+        assert config.execute_horizon >= config.inference_delay, f"{config.execute_horizon=} {config.inference_delay=}"
 
     def execute_chunk(carry, _):
         def step(carry, action):
@@ -76,24 +126,22 @@ def eval(
             return (rng, next_obs, next_env_state), (done, env_state, info)
 
         rng, obs, env_state, action_chunk, n = carry
+        rng, inference_delay = sample_inference_delay(rng, config, policy.action_chunk_size)
         rng, key = jax.random.split(rng)
         if isinstance(config.method, NaiveMethodConfig):
             next_action_chunk = policy.action(key, obs, config.num_flow_steps)
         elif isinstance(config.method, RealtimeMethodConfig):
             prefix_attention_horizon = policy.action_chunk_size - config.execute_horizon
             assert (
-                config.inference_delay <= policy.action_chunk_size
+                policy.action_chunk_size > 0
                 and prefix_attention_horizon <= policy.action_chunk_size
-            ), f"{config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
-            print(
-                f"{config.execute_horizon=} {config.inference_delay=} {prefix_attention_horizon=} {policy.action_chunk_size=}"
-            )
+            ), f"{prefix_attention_horizon=} {policy.action_chunk_size=}"
             next_action_chunk = policy.realtime_action(
                 key,
                 obs,
                 config.num_flow_steps,
                 action_chunk,
-                config.inference_delay,
+                inference_delay,
                 prefix_attention_horizon,
                 config.method.prefix_attention_schedule,
                 config.method.max_guidance_weight,
@@ -107,7 +155,7 @@ def eval(
                 obs,
                 config.num_flow_steps,
                 action_chunk,
-                config.inference_delay,
+                inference_delay,
                 prefix_attention_horizon,
                 config.method.n_samples,
                 bid_k=config.method.bid_k,
@@ -116,14 +164,13 @@ def eval(
         else:
             raise ValueError(f"Unknown method: {config.method}")
 
-        # we execute `inference_delay` actions from the *previously generated* action chunk, and then the remaining
-        # `execute_horizon - inference_delay` actions from the newly generated action chunk
-        action_chunk_to_execute = jnp.concatenate(
-            [
-                action_chunk[:, : config.inference_delay],
-                next_action_chunk[:, config.inference_delay : config.execute_horizon],
-            ],
-            axis=1,
+        # For each executed step: use previous chunk for prefix positions (< d_t), otherwise use newly generated chunk.
+        execute_idx = jnp.arange(config.execute_horizon)
+        old_prefix_mask = execute_idx < inference_delay
+        action_chunk_to_execute = jnp.where(
+            old_prefix_mask[None, :, None],
+            action_chunk[:, : config.execute_horizon],
+            next_action_chunk[:, : config.execute_horizon],
         )
         # throw away the first `execute_horizon` actions from the newly generated action chunk, to align it with the
         # correct frame of reference for the next scan iteration
@@ -140,7 +187,13 @@ def eval(
         )
         # if config.inference_delay > 0:
         #     infos["match"] = jnp.mean(jnp.abs(fixed_prefix - action_chunk_to_execute))
-        return (rng, next_obs, next_env_state, next_action_chunk, next_n), (dones, env_states, infos)
+        return (rng, next_obs, next_env_state, next_action_chunk, next_n), (
+            dones,
+            env_states,
+            infos,
+            inference_delay,
+            action_chunk_to_execute,
+        )
 
     rng, key = jax.random.split(rng)
     obs, env_state = env.reset_to_level(key, level, env_params)
@@ -148,13 +201,17 @@ def eval(
     action_chunk = policy.action(key, obs, config.num_flow_steps)  # [batch, horizon, action_dim]
     n = jnp.ones(action_chunk.shape[1], dtype=jnp.int32)
     scan_length = math.ceil(env_params.max_timesteps / config.execute_horizon)
-    _, (dones, env_states, infos) = jax.lax.scan(
+    _, (dones, env_states, infos, delays, executed_actions) = jax.lax.scan(
         execute_chunk,
         (rng, obs, env_state, action_chunk, n),
         None,
         length=scan_length,
     )
     dones, env_states, infos = jax.tree.map(lambda x: x.reshape(-1, *x.shape[2:]), (dones, env_states, infos))
+    # [num_chunks, batch, execute_horizon, action_dim] -> [T, batch, action_dim]
+    executed_actions = executed_actions.transpose(0, 2, 1, 3).reshape(
+        -1, executed_actions.shape[1], executed_actions.shape[3]
+    )
     assert dones.shape[0] >= env_params.max_timesteps, f"{dones.shape=}"
     return_info = {}
     for key in ["returned_episode_returns", "returned_episode_lengths", "returned_episode_solved"]:
@@ -164,6 +221,26 @@ def eval(
     for key in ["match"]:
         if key in infos:
             return_info[key] = jnp.mean(infos[key])
+
+    # Delay distribution metrics for tail experiments.
+    delays = delays.astype(jnp.float32)
+    return_info["d_p50"] = jnp.percentile(delays, 50)
+    return_info["d_p95"] = jnp.percentile(delays, 95)
+    return_info["d_p99"] = jnp.percentile(delays, 99)
+    max_safe_delay = policy.action_chunk_size - config.execute_horizon
+    return_info["p_violate"] = jnp.mean((delays > max_safe_delay).astype(jnp.float32))
+
+    # Control smoothness proxies measured on executed action trajectories.
+    delta = executed_actions[1:] - executed_actions[:-1]  # [T-1, batch, action_dim]
+    delta_norm = jnp.linalg.norm(delta, axis=-1)  # [T-1, batch]
+    return_info["max_delta_action"] = jnp.mean(jnp.max(delta_norm, axis=0))
+    if delta.shape[0] >= 2:
+        ddelta = delta[1:] - delta[:-1]  # [T-2, batch, action_dim]
+        ddelta_norm = jnp.linalg.norm(ddelta, axis=-1)  # [T-2, batch]
+        return_info["max_ddelta_action"] = jnp.mean(jnp.max(ddelta_norm, axis=0))
+    else:
+        return_info["max_ddelta_action"] = jnp.array(0.0, dtype=jnp.float32)
+
     video = render_video(jax.tree.map(lambda x: x[:, 0], env_states))
     return return_info, video
 
