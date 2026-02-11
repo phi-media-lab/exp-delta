@@ -1,5 +1,7 @@
 # exp-delta：RTC 尾延迟实验仓库
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 本仓库是一个面向实验的方法学分支，主要用于评估 **Real-Time Chunking (RTC)** 在**长尾推理延迟**与**尾延迟控制（tail control）**场景下的表现。
 
 基础论文背景：

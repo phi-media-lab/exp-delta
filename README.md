@@ -1,5 +1,7 @@
 # exp-delta: RTC Tail-Delay Experiment Repo
 
+[English](README.md) | [中文](README.zh-CN.md)
+
 This repository is an experiment-focused fork for evaluating **real-time chunking (RTC)** under **long-tail inference delay** and **tail-control** settings.
 
 Base project context:
